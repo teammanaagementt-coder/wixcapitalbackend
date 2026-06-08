@@ -5,6 +5,7 @@ const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
 const multer = require('multer');
 const path = require('path');
+const cron = require('node-cron');
 
 // ─── Import Models ──────────────────────────────────────────────
 const User = require('./models/User');
@@ -288,9 +289,20 @@ const createTrade = async (req, res) => {
   try {
     const { symbol, type, amount, price } = req.body;
     const userId = req.user.userId;
-
     const total = parseFloat(amount) * parseFloat(price);
     const fee = total * 0.001;
+
+    const user = await User.findById(userId);
+    if (!user) return res.status(404).json({ message: 'User not found' });
+
+    if (type === 'buy') {
+      if (total + fee > user.balance) {
+        return res.status(400).json({ message: 'Insufficient balance' });
+      }
+      user.balance -= (total + fee);
+    } else { // sell
+      user.balance += (total - fee);
+    }
 
     const trade = new Trade({
       user: userId,
@@ -304,6 +316,8 @@ const createTrade = async (req, res) => {
     });
     await trade.save();
 
+    await user.save();
+
     await Transaction.create({
       user: userId,
       type: 'trade',
@@ -312,7 +326,7 @@ const createTrade = async (req, res) => {
       reference: trade._id,
     });
 
-    res.status(201).json({ message: 'Trade executed', trade });
+    res.status(201).json({ message: 'Trade executed', trade, user: { balance: user.balance } });
   } catch (err) {
     console.error(err);
     res.status(500).json({ message: 'Server error' });
@@ -424,7 +438,16 @@ const openFuturesPosition = async (req, res) => {
     user.balance -= parseFloat(margin);
     await user.save();
 
-    res.status(201).json({ message: 'Futures position opened', futures });
+    // ✅ Create transaction record so it appears in history
+    await Transaction.create({
+      user: userId,
+      type: 'futures',
+      amount: -parseFloat(margin),
+      description: `Open ${position} ${pair} ${leverage}x | Margin: $${margin}`,
+      reference: futures._id,
+    });
+
+    res.status(201).json({ message: 'Futures position opened', futures, user: { balance: user.balance } });
   } catch (err) {
     console.error(err);
     res.status(500).json({ message: 'Server error' });
@@ -816,6 +839,55 @@ app.delete('/api/admin/investment-plans/:id', verifyToken, isAdmin, async (req, 
   } catch (err) {
     console.error(err);
     res.status(500).json({ message: 'Server error' });
+  }
+});
+
+
+
+// Run every day at midnight
+cron.schedule('0 0 * * *', async () => {
+  console.log('Running daily investment profit distribution...');
+  const now = new Date();
+
+  try {
+    const activeInvestments = await UserInvestment.find({
+      status: 'active',
+      endDate: { $gte: now },
+    });
+
+    for (const inv of activeInvestments) {
+      const user = await User.findById(inv.user);
+      if (!user) continue;
+
+      const dailyProfit = (inv.amount * inv.dailyReturn) / 100;
+      user.balance += dailyProfit;
+      user.profit += dailyProfit;
+
+      // Check if investment is completed (endDate has passed)
+      if (now >= inv.endDate) {
+        inv.status = 'completed';
+        user.balance += inv.amount; // return principal
+        await Transaction.create({
+          user: user._id,
+          type: 'roi',
+          amount: inv.totalReturn,
+          description: `Investment ${inv.planId} completed – principal + profit returned`,
+        });
+      } else {
+        await Transaction.create({
+          user: user._id,
+          type: 'roi',
+          amount: dailyProfit,
+          description: `Daily ROI from ${inv.planId} plan`,
+        });
+      }
+
+      await inv.save();
+      await user.save();
+    }
+    console.log('Daily investment distribution complete.');
+  } catch (err) {
+    console.error('Investment cron error:', err);
   }
 });
 
