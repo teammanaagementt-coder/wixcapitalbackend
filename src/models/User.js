@@ -6,7 +6,7 @@ const userSchema = new mongoose.Schema({
   name: { type: String, required: true },
   email: { type: String, required: true, unique: true },
   password: { type: String, required: true },
-  role: { type: String, enum: ['user', 'admin'], default: 'user' }, // 👈 NEW FIELD
+  role: { type: String, enum: ['user', 'admin'], default: 'user' },
   balance: { type: Number, default: 0 },
   bonus: { type: Number, default: 0 },
   profit: { type: Number, default: 0 },
@@ -18,6 +18,7 @@ const userSchema = new mongoose.Schema({
   totalReferrals: { type: Number, default: 0 },
   isVerified: { type: Boolean, default: false },
   kycStatus: { type: String, enum: ['unverified', 'pending', 'verified'], default: 'unverified' },
+  isActive: { type: Boolean, default: true }, // 👈 NEW: controls account suspension
   currency: { type: String, default: 'USD' },
   language: { type: String, default: 'English' },
   twoFactorEnabled: { type: Boolean, default: false },

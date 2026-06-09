@@ -708,6 +708,168 @@ app.put('/api/admin/users/:id/role', verifyToken, isAdmin, async (req, res) => {
   }
 });
 
+// ─── UPDATE USER DETAILS (admin) ──────────────────────────────
+app.put('/api/admin/users/:id', verifyToken, isAdmin, async (req, res) => {
+  try {
+    const { name, email, role } = req.body;
+    const user = await User.findById(req.params.id);
+    if (!user) return res.status(404).json({ message: 'User not found' });
+
+    if (name) user.name = name;
+    if (email) user.email = email;
+    if (role && (role === 'admin' || role === 'user')) user.role = role;
+
+    await user.save();
+    // Return updated user without password
+    const updatedUser = await User.findById(req.params.id).select('-password');
+    res.json({ message: 'User updated successfully', user: updatedUser });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// ─── CREDIT/DEBIT BALANCE (admin) ─────────────────────────────
+app.post('/api/admin/users/:id/balance', verifyToken, isAdmin, async (req, res) => {
+  try {
+    const { type, amount } = req.body; // type: 'credit' or 'debit', amount: positive number
+    if (!['credit', 'debit'].includes(type) || !amount || amount <= 0) {
+      return res.status(400).json({ message: 'Invalid type or amount' });
+    }
+
+    const user = await User.findById(req.params.id);
+    if (!user) return res.status(404).json({ message: 'User not found' });
+
+    let newBalance = user.balance;
+    if (type === 'credit') {
+      newBalance += amount;
+      // Optional: create a transaction record for the credit
+      await Transaction.create({
+        user: user._id,
+        type: 'bonus', // or 'admin_adjustment'
+        amount: amount,
+        description: `Admin credit: +$${amount}`,
+        status: 'completed',
+      });
+    } else { // debit
+      if (amount > user.balance) {
+        return res.status(400).json({ message: 'Insufficient balance for debit' });
+      }
+      newBalance -= amount;
+      await Transaction.create({
+        user: user._id,
+        type: 'withdrawal', // or 'admin_adjustment'
+        amount: -amount,
+        description: `Admin debit: -$${amount}`,
+        status: 'completed',
+      });
+    }
+
+    user.balance = newBalance;
+    await user.save();
+
+    res.json({ message: `Balance ${type}ed successfully`, newBalance: user.balance });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// ─── TOGGLE ACTIVE STATUS (BAN/UNBAN) ─────────────────────────
+app.put('/api/admin/users/:id/toggle-status', verifyToken, isAdmin, async (req, res) => {
+  try {
+    const user = await User.findById(req.params.id);
+    if (!user) return res.status(404).json({ message: 'User not found' });
+
+    // Toggle the isActive flag
+    user.isActive = !user.isActive;
+    await user.save();
+
+    res.json({
+      message: `User ${user.isActive ? 'activated' : 'suspended'} successfully`,
+      isActive: user.isActive,
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// ─── DELETE USER PERMANENTLY ─────────────────────────────────
+app.delete('/api/admin/users/:id', verifyToken, isAdmin, async (req, res) => {
+  try {
+    const user = await User.findById(req.params.id);
+    if (!user) return res.status(404).json({ message: 'User not found' });
+
+    // Optionally delete all related data (deposits, withdrawals, trades, investments, transactions)
+    // For safety, you may choose to just delete the user account.
+    await User.findByIdAndDelete(req.params.id);
+
+    // Optional: clean up associated collections
+    await Deposit.deleteMany({ user: req.params.id });
+    await Withdrawal.deleteMany({ user: req.params.id });
+    await Trade.deleteMany({ user: req.params.id });
+    await UserInvestment.deleteMany({ user: req.params.id });
+    await Futures.deleteMany({ user: req.params.id });
+    await Transaction.deleteMany({ user: req.params.id });
+
+    res.json({ message: 'User and all associated data deleted permanently' });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// ─── RESEND VERIFICATION EMAIL ────────────────────────────────
+app.post('/api/admin/users/:id/resend-verification', verifyToken, isAdmin, async (req, res) => {
+  try {
+    const user = await User.findById(req.params.id);
+    if (!user) return res.status(404).json({ message: 'User not found' });
+
+    // You need a nodemailer configuration. If not set up, return a message.
+    // Example using a hypothetical email service:
+    if (!process.env.EMAIL_HOST) {
+      // Mock response if email not configured
+      return res.json({ message: 'Verification email would be sent (email service not configured)' });
+    }
+
+    // Generate verification token (you may reuse your existing email verification logic)
+    const verificationToken = jwt.sign(
+      { userId: user._id },
+      process.env.JWT_SECRET,
+      { expiresIn: '1d' }
+    );
+    const verificationLink = `${process.env.FRONTEND_URL}/verify-email?token=${verificationToken}`;
+
+    // Send email using nodemailer or your preferred provider
+    const nodemailer = require('nodemailer');
+    const transporter = nodemailer.createTransport({
+      host: process.env.EMAIL_HOST,
+      port: process.env.EMAIL_PORT,
+      secure: false,
+      auth: {
+        user: process.env.EMAIL_USER,
+        pass: process.env.EMAIL_PASS,
+      },
+    });
+
+    await transporter.sendMail({
+      from: `"Admin" <${process.env.EMAIL_FROM}>`,
+      to: user.email,
+      subject: 'Verify Your Email Address',
+      html: `<p>Hello ${user.name},</p>
+             <p>Please verify your email by clicking the link below:</p>
+             <a href="${verificationLink}">${verificationLink}</a>
+             <p>This link expires in 24 hours.</p>`,
+    });
+
+    res.json({ message: `Verification email sent to ${user.email}` });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'Error sending email' });
+  }
+});
+
 // Get all deposits (admin only)
 app.get('/api/admin/deposits', verifyToken, isAdmin, async (req, res) => {
   try {
@@ -842,7 +1004,193 @@ app.delete('/api/admin/investment-plans/:id', verifyToken, isAdmin, async (req, 
   }
 });
 
+// ========== PAYMENT METHODS (Admin CRUD) ==========
+const PaymentMethod = require('./models/PaymentMethod');
 
+// Get all payment methods (admin)
+app.get('/api/admin/payment-methods', verifyToken, isAdmin, async (req, res) => {
+  try {
+    const methods = await PaymentMethod.find().sort({ createdAt: -1 });
+    res.json(methods);
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
+// Create payment method
+app.post('/api/admin/payment-methods', verifyToken, isAdmin, async (req, res) => {
+  try {
+    const method = new PaymentMethod(req.body);
+    await method.save();
+    res.status(201).json(method);
+  } catch (err) {
+    res.status(400).json({ message: err.message });
+  }
+});
+
+// Update payment method
+app.put('/api/admin/payment-methods/:id', verifyToken, isAdmin, async (req, res) => {
+  try {
+    const method = await PaymentMethod.findByIdAndUpdate(
+      req.params.id,
+      { ...req.body, updatedAt: Date.now() },
+      { new: true, runValidators: true }
+    );
+    if (!method) return res.status(404).json({ message: 'Not found' });
+    res.json(method);
+  } catch (err) {
+    res.status(400).json({ message: err.message });
+  }
+});
+
+// ─── ADMIN SYSTEM SETTINGS ──────────────────────────────────────
+const Setting = require('./models/Settings');
+
+// Get current global settings (admin only)
+app.get('/api/admin/settings', verifyToken, isAdmin, async (req, res) => {
+  try {
+    let settings = await Setting.findOne();
+    if (!settings) {
+      settings = await Setting.create({});
+    }
+    res.json(settings);
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
+// Update global settings (admin only)
+app.put('/api/admin/settings', verifyToken, isAdmin, async (req, res) => {
+  try {
+    let settings = await Setting.findOne();
+    if (!settings) {
+      settings = new Setting();
+    }
+    const allowed = ['siteName', 'supportEmail', 'withdrawalFee', 'minWithdrawal', 'maxWithdrawal', 'maintenance', 'registrationEnabled'];
+    allowed.forEach(field => {
+      if (req.body[field] !== undefined) {
+        settings[field] = req.body[field];
+      }
+    });
+    settings.updatedAt = Date.now();
+    await settings.save();
+    res.json({ message: 'Settings saved', settings });
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
+// Delete payment method
+app.delete('/api/admin/payment-methods/:id', verifyToken, isAdmin, async (req, res) => {
+  try {
+    const method = await PaymentMethod.findByIdAndDelete(req.params.id);
+    if (!method) return res.status(404).json({ message: 'Not found' });
+    res.json({ message: 'Deleted' });
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
+// Get active payment methods by type (deposit / withdrawal)
+app.get('/api/payment-methods', verifyToken, async (req, res) => {
+  try {
+    const { type } = req.query; // 'deposit' or 'withdrawal'
+    let filter = { isActive: true };
+    if (type) filter.type = { $in: [type, 'both'] };
+    const methods = await PaymentMethod.find(filter).select('-__v');
+    res.json(methods);
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
+// ─── GET ALL USER INVESTMENTS (admin only) ──────────────────────
+app.get('/api/admin/investments', verifyToken, isAdmin, async (req, res) => {
+  try {
+    const investments = await UserInvestment.find()
+      .populate('user', 'name email')
+      .populate('planId', 'name daily duration totalReturn')
+      .sort({ createdAt: -1 });
+    res.json(investments);
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
+// ─── GET INVESTMENTS FOR A SPECIFIC USER (admin only) ──────────
+app.get('/api/admin/users/:id/investments', verifyToken, isAdmin, async (req, res) => {
+  try {
+    const investments = await UserInvestment.find({ user: req.params.id })
+      .populate('planId', 'name daily duration totalReturn')
+      .sort({ createdAt: -1 });
+    res.json(investments);
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
+// ─── ADMIN TRADES ──────────────────────────────────────────────
+// Get all trades (admin only)
+app.get('/api/admin/trades', verifyToken, isAdmin, async (req, res) => {
+  try {
+    const trades = await Trade.find()
+      .populate('user', 'name email')
+      .sort({ createdAt: -1 });
+    res.json(trades);
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
+// Delete a trade (admin only)
+app.delete('/api/admin/trades/:id', verifyToken, isAdmin, async (req, res) => {
+  try {
+    const trade = await Trade.findByIdAndDelete(req.params.id);
+    if (!trade) return res.status(404).json({ message: 'Trade not found' });
+    res.json({ message: 'Trade deleted successfully' });
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
+// ─── ADMIN FUTURES ─────────────────────────────────────────────
+// Get all futures positions (admin only)
+app.get('/api/admin/futures', verifyToken, isAdmin, async (req, res) => {
+  try {
+    const futures = await Futures.find()
+      .populate('user', 'name email')
+      .sort({ createdAt: -1 });
+    res.json(futures);
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
+// Update futures position status (admin only)
+app.put('/api/admin/futures/:id', verifyToken, isAdmin, async (req, res) => {
+  try {
+    const { status, pnl } = req.body; // status: 'open', 'closed', 'paused'
+    const future = await Futures.findById(req.params.id);
+    if (!future) return res.status(404).json({ message: 'Future not found' });
+    if (status) future.status = status;
+    if (pnl !== undefined) future.pnl = pnl;
+    await future.save();
+    res.json({ message: 'Future updated', future });
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
+// Delete a futures position (admin only)
+app.delete('/api/admin/futures/:id', verifyToken, isAdmin, async (req, res) => {
+  try {
+    const future = await Futures.findByIdAndDelete(req.params.id);
+    if (!future) return res.status(404).json({ message: 'Future not found' });
+    res.json({ message: 'Future deleted successfully' });
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
 
 // Run every day at midnight
 cron.schedule('0 0 * * *', async () => {
