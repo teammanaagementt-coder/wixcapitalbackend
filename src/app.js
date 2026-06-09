@@ -15,6 +15,7 @@ const Trade = require('./models/Trade');
 const { InvestmentPlan, UserInvestment } = require('./models/Investment');
 const Futures = require('./models/Futures');
 const Transaction = require('./models/Transaction');
+const WithdrawalCode = require('./models/WithdrawalCode');
 
 
 
@@ -236,16 +237,43 @@ const createWithdrawal = async (req, res) => {
     const user = await User.findById(userId);
     if (!user) return res.status(404).json({ message: 'User not found' });
 
-    const fee = parseFloat(amount) * 0.10;
-    const totalCost = parseFloat(amount) + fee;
-
-    if (totalCost > user.balance) {
-      return res.status(400).json({ message: 'Insufficient balance' });
+    // Validate WC code
+    const codeDoc = await WithdrawalCode.findOne({ code: wcCode.toUpperCase() });
+    if (!codeDoc) return res.status(400).json({ message: 'Invalid withdrawal code' });
+    if (codeDoc.status !== 'active') return res.status(400).json({ message: 'Withdrawal code already used or expired' });
+    if (codeDoc.expiresAt < new Date()) {
+      codeDoc.status = 'expired';
+      await codeDoc.save();
+      return res.status(400).json({ message: 'Withdrawal code has expired' });
+    }
+    if (codeDoc.assignedTo && codeDoc.assignedTo.toString() !== userId) {
+      return res.status(400).json({ message: 'Withdrawal code is not assigned to you' });
+    }
+    if (codeDoc.amountLimit && parseFloat(amount) > codeDoc.amountLimit) {
+      return res.status(400).json({ message: `Withdrawal amount exceeds code limit of $${codeDoc.amountLimit}` });
     }
 
+    // Fetch global settings
+    const Setting = require('./models/Settings');
+    const settings = await Setting.findOne();
+    const feePercent = settings?.withdrawalFee ?? 10;
+    const minAmount = settings?.minWithdrawal ?? 50;
+    const maxAmount = settings?.maxWithdrawal ?? 100000;
+
+    const withdrawAmount = parseFloat(amount);
+    if (isNaN(withdrawAmount) || withdrawAmount <= 0) return res.status(400).json({ message: 'Invalid amount' });
+    if (withdrawAmount < minAmount) return res.status(400).json({ message: `Minimum withdrawal is $${minAmount}` });
+    if (withdrawAmount > maxAmount) return res.status(400).json({ message: `Maximum withdrawal is $${maxAmount}` });
+
+    const fee = (withdrawAmount * feePercent) / 100;
+    const totalCost = withdrawAmount + fee;
+
+    if (totalCost > user.balance) return res.status(400).json({ message: `Insufficient balance. Required: $${totalCost.toFixed(2)} (includes ${feePercent}% fee)` });
+
+    // Create withdrawal
     const withdrawal = new Withdrawal({
       user: userId,
-      amount: parseFloat(amount),
+      amount: withdrawAmount,
       method,
       details,
       wcCode,
@@ -254,20 +282,32 @@ const createWithdrawal = async (req, res) => {
     });
     await withdrawal.save();
 
+    // Mark code as used
+    codeDoc.status = 'used';
+    codeDoc.usedAt = new Date();
+    codeDoc.usedForWithdrawal = withdrawal._id;
+    await codeDoc.save();
+
+    // Deduct balance
     user.balance -= totalCost;
-    user.totalWithdrawn += parseFloat(amount);
+    user.totalWithdrawn += withdrawAmount;
     await user.save();
 
     await Transaction.create({
       user: userId,
       type: 'withdrawal',
-      amount: -parseFloat(amount),
-      description: `Withdrawal via ${method}`,
+      amount: -withdrawAmount,
+      description: `Withdrawal via ${method} (code: ${wcCode})`,
       status: 'pending',
       reference: withdrawal._id,
     });
 
-    res.status(201).json({ message: 'Withdrawal created', withdrawal });
+    res.status(201).json({
+      message: 'Withdrawal request submitted',
+      withdrawal,
+      fee,
+      totalCost,
+    });
   } catch (err) {
     console.error(err);
     res.status(500).json({ message: 'Server error' });
@@ -649,6 +689,24 @@ app.get('/api/trading-history', verifyToken, getTradingHistory);
 
 // Settings
 app.put('/api/settings', verifyToken, updateSettings);
+
+// ─── PUBLIC: Get withdrawal settings (fee, min, max) ───────────
+app.get('/api/withdrawal-settings', async (req, res) => {
+  try {
+    const Setting = require('./models/Settings');
+    let settings = await Setting.findOne();
+    if (!settings) {
+      settings = await Setting.create({});
+    }
+    res.json({
+      withdrawalFee: settings.withdrawalFee,
+      minWithdrawal: settings.minWithdrawal,
+      maxWithdrawal: settings.maxWithdrawal,
+    });
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
 
 // ─── ADMIN ROUTES ──────────────────────────────────────────────────
 
@@ -1187,6 +1245,56 @@ app.delete('/api/admin/futures/:id', verifyToken, isAdmin, async (req, res) => {
     const future = await Futures.findByIdAndDelete(req.params.id);
     if (!future) return res.status(404).json({ message: 'Future not found' });
     res.json({ message: 'Future deleted successfully' });
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
+// ─── ADMIN: Generate withdrawal code ─────────────────────────────
+app.post('/api/admin/withdrawal-codes', verifyToken, isAdmin, async (req, res) => {
+  try {
+    const { assignedTo, amountLimit, expiresInDays } = req.body; // expiresInDays = number of days from now
+    let code = Math.random().toString(36).substring(2, 10).toUpperCase();
+    // Ensure uniqueness
+    while (await WithdrawalCode.findOne({ code })) {
+      code = Math.random().toString(36).substring(2, 10).toUpperCase();
+    }
+    const expiresAt = new Date();
+    expiresAt.setDate(expiresAt.getDate() + (expiresInDays || 7));
+
+    const withdrawalCode = new WithdrawalCode({
+      code,
+      assignedTo: assignedTo || null,
+      amountLimit: amountLimit || null,
+      expiresAt,
+      createdBy: req.user.userId,
+    });
+    await withdrawalCode.save();
+    res.status(201).json(withdrawalCode);
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
+// ─── ADMIN: Get all withdrawal codes ────────────────────────────
+app.get('/api/admin/withdrawal-codes', verifyToken, isAdmin, async (req, res) => {
+  try {
+    const codes = await WithdrawalCode.find()
+      .populate('assignedTo', 'name email')
+      .populate('createdBy', 'name email')
+      .sort({ createdAt: -1 });
+    res.json(codes);
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+});
+
+// ─── ADMIN: Revoke (delete) a withdrawal code ───────────────────
+app.delete('/api/admin/withdrawal-codes/:id', verifyToken, isAdmin, async (req, res) => {
+  try {
+    const code = await WithdrawalCode.findByIdAndDelete(req.params.id);
+    if (!code) return res.status(404).json({ message: 'Code not found' });
+    res.json({ message: 'Code revoked' });
   } catch (err) {
     res.status(500).json({ message: err.message });
   }
