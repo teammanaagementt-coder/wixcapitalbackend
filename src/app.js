@@ -1162,6 +1162,31 @@ app.get('/api/payment-methods', verifyToken, async (req, res) => {
   }
 });
 
+
+// ─── CHANGE PASSWORD (any authenticated user) ──────────────────
+app.put('/api/change-password', verifyToken, async (req, res) => {
+  try {
+    const { currentPassword, newPassword } = req.body;
+    if (!currentPassword || !newPassword) {
+      return res.status(400).json({ message: 'Current and new password are required' });
+    }
+    const user = await User.findById(req.user.userId);
+    if (!user) return res.status(404).json({ message: 'User not found' });
+
+    const isMatch = await user.comparePassword(currentPassword);
+    if (!isMatch) return res.status(400).json({ message: 'Current password is incorrect' });
+
+    user.password = newPassword;   // will be hashed by the pre‑save hook
+    await user.save();
+    res.json({ message: 'Password updated successfully' });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'Server error' });
+  }
+});
+
+
+
 // ─── GET ALL USER INVESTMENTS (admin only) ──────────────────────
 app.get('/api/admin/investments', verifyToken, isAdmin, async (req, res) => {
   try {
